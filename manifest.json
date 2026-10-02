@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "id": "saigkill.bluesky",
+  "name": "Bluesky client",
+  "version": "1.0.0",
+  "author": "Sascha Manns",
+  "license": "MIT",
+  "description": "Bluesky client with app password login, Following/Discover/Mentions feeds, posting with images and alt text, and post interactions",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Bluesky client",
+    "description": "Bluesky icon in the bar. Opens a panel with login, feeds (Following, Discover, Mentions), a composer that can attach images, and post interactions.",
+    "category": "Internet",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}
