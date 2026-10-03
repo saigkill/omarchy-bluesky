@@ -30,11 +30,14 @@ import base64
 import datetime
 import fcntl
 import html as html_module
+import http.client
 import ipaddress
 import json
 import os
 import re
 import shutil
+import socket
+import ssl
 import stat
 import subprocess
 import sys
@@ -63,6 +66,8 @@ TIMEOUT = 30
 # gets a much shorter leash than an API call. A slow site costs the card, not
 # the post.
 CARD_TIMEOUT = 8
+# A preview fetch follows at most this many redirects, each one re-checked.
+MAX_CARD_REDIRECTS = 5
 
 # A timeline page is a few hundred kilobytes at most. 10 MiB is generous
 # headroom while still being far too small for a misbehaving server to exhaust
@@ -864,18 +869,125 @@ def unescape_html(text):
     return html_module.unescape(text)
 
 
-def fetch_public(url, limit, accept):
-    """GET a public URL without any credential, bounded in time and bytes."""
-    parts = urllib.parse.urlsplit(url)
-    if parts.scheme not in ("http", "https") or not parts.hostname:
-        return b"", ""
-    request = urllib.request.Request(url, headers={
-        "User-Agent": "Mozilla/5.0 (compatible; %s)" % APP_NAME, "Accept": accept})
+def is_public_address(address):
+    """True only for an address on the public internet.
+
+    The page behind a link decides where its og:image points, and the image
+    ends up in the published post. Without this check a hostile page could
+    point at the router, a LAN camera or a service on this machine and have
+    the user publish what it returns. IPv4 carried inside IPv6 (mapped, 6to4,
+    Teredo) is judged by the IPv4 address it carries.
+    """
     try:
-        with urllib.request.urlopen(request, timeout=CARD_TIMEOUT) as response:
+        ip = ipaddress.ip_address(address.split("%", 1)[0])
+    except ValueError:
+        return False
+    if ip.version == 6:
+        embedded = ip.ipv4_mapped or ip.sixtofour or (ip.teredo[1] if ip.teredo else None)
+        if embedded is not None:
+            ip = embedded
+    return ip.is_global and not ip.is_multicast
+
+
+def public_addresses(host, port):
+    """The addresses for host, or [] if any of them is not public.
+
+    Every address has to pass, not just one: a name with one public and one
+    private address would otherwise reach the private one on a retry.
+    """
+    try:
+        infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    except (OSError, UnicodeError):
+        return []
+    addresses = []
+    for info in infos:
+        address = info[4][0]
+        if not is_public_address(address):
+            return []
+        if address not in addresses:
+            addresses.append(address)
+    return addresses
+
+
+class PinnedConnection:
+    """Connect to an address that was already checked, not to the name again.
+
+    Resolving twice would let a name answer with a public address for the
+    check and a private one for the connection (DNS rebinding). The name still
+    goes into the Host header and, for https, into SNI and the certificate
+    check.
+    """
+
+    def __init__(self, addresses, *args, **kwargs):
+        self.addresses = addresses
+        super().__init__(*args, **kwargs)
+
+    def open_socket(self):
+        error = OSError("no address")
+        for address in self.addresses:
+            try:
+                return socket.create_connection((address, self.port), self.timeout)
+            except OSError as caught:
+                error = caught
+        raise error
+
+
+class PinnedHTTPConnection(PinnedConnection, http.client.HTTPConnection):
+    def connect(self):
+        self.sock = self.open_socket()
+
+
+class PinnedHTTPSConnection(PinnedConnection, http.client.HTTPSConnection):
+    def __init__(self, addresses, host, port, timeout):
+        self.tls = ssl.create_default_context()
+        super().__init__(addresses, host, port, timeout=timeout, context=self.tls)
+
+    def connect(self):
+        self.sock = self.tls.wrap_socket(self.open_socket(), server_hostname=self.host)
+
+
+def fetch_public(url, limit, accept):
+    """GET a public URL without any credential, bounded in time and bytes.
+
+    Only destinations on the public internet are contacted, and redirects are
+    followed by hand so every hop is checked the same way. urllib is not used
+    because it follows redirects on its own and honours proxy variables, and
+    a proxy would resolve the name itself, past the check.
+    """
+    for _hop in range(MAX_CARD_REDIRECTS + 1):
+        parts = urllib.parse.urlsplit(url)
+        if parts.scheme not in ("http", "https") or not parts.hostname:
+            return b"", ""
+        try:
+            port = parts.port or (443 if parts.scheme == "https" else 80)
+        except ValueError:
+            return b"", ""
+        addresses = public_addresses(parts.hostname, port)
+        if not addresses:
+            return b"", ""
+        target = urllib.parse.quote(parts.path or "/", safe="/%:@!$&'()*+,;=-._~")
+        if parts.query:
+            target += "?" + urllib.parse.quote(parts.query, safe="/%:@!$&'()*+,;=-._~?")
+        kind = PinnedHTTPSConnection if parts.scheme == "https" else PinnedHTTPConnection
+        connection = kind(addresses, parts.hostname, port, timeout=CARD_TIMEOUT)
+        try:
+            connection.request("GET", target, headers={
+                "User-Agent": "Mozilla/5.0 (compatible; %s)" % APP_NAME, "Accept": accept})
+            response = connection.getresponse()
+            if response.status in (301, 302, 303, 307, 308):
+                location = response.getheader("Location") or ""
+                if not location:
+                    return b"", ""
+                url = urllib.parse.urljoin(url, location)
+                continue
+            if response.status != 200:
+                return b"", ""
             return response.read(limit + 1), response.headers.get_content_type()
-    except (urllib.error.URLError, OSError, ValueError):
-        return b"", ""
+        except (http.client.HTTPException, OSError, ValueError, UnicodeError):
+            return b"", ""
+        finally:
+            connection.close()
+    return b"", ""
 
 
 def link_card(url):

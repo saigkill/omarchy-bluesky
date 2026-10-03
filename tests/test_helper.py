@@ -19,6 +19,7 @@ import io
 import json
 import os
 import shutil
+import socket
 import stat
 import subprocess
 import ssl
@@ -711,6 +712,139 @@ class BuildingPosts(HelperTestCase):
         self.assertEqual(sent["record"]["text"], "hello world")
         self.assertEqual(sent["record"]["langs"], ["de"])
         self.assertEqual(json.loads(result.stdout)["cid"], "bafyreicreated123")
+
+
+# ---------------------------------------------------------- link previews
+
+
+class PreviewServer:
+    """A plain HTTP server on one loopback address, recording what it served."""
+
+    def __init__(self, address, routes):
+        self.hits = []
+        server = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                server.hits.append(self.path)
+                status, headers, body = routes.get(self.path, (404, {}, b""))
+                self.send_response(status)
+                for name, value in headers.items():
+                    self.send_header(name, value)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *_args):
+                pass
+
+        self.httpd = ThreadingHTTPServer((address, 0), Handler)
+        self.port = self.httpd.server_address[1]
+        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+
+    def close(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+
+
+class PreviewsStayOnThePublicInternet(unittest.TestCase):
+    """A linked page chooses its og:image, and the image is published. Nothing
+    on this machine or the LAN may be reachable that way."""
+
+    PAGE = b"<html><head><title>t</title></head></html>"
+
+    def serve(self, address, routes):
+        server = PreviewServer(address, routes)
+        self.addCleanup(server.close)
+        return server
+
+    def pretend_public(self, address):
+        """Let one loopback address stand in for a public host."""
+        original = helper.is_public_address
+        patcher = unittest.mock.patch.object(
+            helper, "is_public_address", lambda a: a == address or original(a))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_private_and_special_addresses_are_not_public(self):
+        for address in ("127.0.0.1", "10.1.2.3", "172.16.0.1", "192.168.1.20", "169.254.169.254",
+                        "100.64.0.1", "0.0.0.0", "224.0.0.1", "255.255.255.255", "::1", "::",
+                        "fe80::1", "fc00::1", "::ffff:192.168.1.20", "2002:c0a8:0114::1",
+                        "ff02::1", "not an address"):
+            self.assertFalse(helper.is_public_address(address), address)
+        for address in ("1.1.1.1", "93.184.215.14", "2606:4700:4700::1111"):
+            self.assertTrue(helper.is_public_address(address), address)
+
+    def test_a_loopback_page_is_never_contacted(self):
+        server = self.serve("127.0.0.1", {"/": (200, {"Content-Type": "text/html"}, self.PAGE)})
+        for url in ("http://127.0.0.1:%d/" % server.port, "http://localhost:%d/" % server.port,
+                    "http://[::ffff:127.0.0.1]:%d/" % server.port):
+            self.assertEqual(helper.fetch_public(url, 1000, "*/*"), (b"", ""), url)
+        self.assertEqual(server.hits, [])
+
+    def test_a_name_with_any_private_address_is_refused(self):
+        answers = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("1.1.1.1", 80)),
+                   (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("192.168.1.20", 80))]
+        with unittest.mock.patch.object(helper.socket, "getaddrinfo", return_value=answers), \
+                unittest.mock.patch.object(helper.socket, "create_connection") as connect:
+            self.assertEqual(helper.fetch_public("http://camera.example/", 1000, "*/*"), (b"", ""))
+        connect.assert_not_called()
+
+    def test_the_checked_address_is_the_one_connected_to(self):
+        public = self.serve("127.0.0.2", {"/": (200, {"Content-Type": "text/html"}, self.PAGE)})
+        self.pretend_public("127.0.0.2")
+        resolved = []
+        real_getaddrinfo = socket.getaddrinfo
+
+        def getaddrinfo(host, port, *args, **kwargs):
+            # create_connection() passes the pinned address through
+            # getaddrinfo as well; a literal never reaches DNS.
+            if host[0].isdigit():
+                return real_getaddrinfo(host, port, *args, **kwargs)
+            # A rebinding name: public for the first lookup, private afterwards.
+            resolved.append(host)
+            address = "127.0.0.2" if len(resolved) == 1 else "127.0.0.1"
+            return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (address, port))]
+
+        with unittest.mock.patch.object(helper.socket, "getaddrinfo", getaddrinfo):
+            body, kind = helper.fetch_public("http://rebind.example:%d/" % public.port, 1000, "*/*")
+        self.assertEqual((body, kind), (self.PAGE, "text/html"))
+        self.assertEqual(resolved, ["rebind.example"], "resolved once, then pinned")
+
+    def test_a_redirect_into_the_lan_is_not_followed(self):
+        secret = self.serve("127.0.0.1", {"/snapshot.jpg": (200, {"Content-Type": "image/jpeg"}, b"secret")})
+        hop = "http://127.0.0.1:%d/snapshot.jpg" % secret.port
+        public = self.serve("127.0.0.2", {
+            "/img": (302, {"Location": hop}, b""),
+            "/ok": (301, {"Location": "/final"}, b""),
+            "/final": (200, {"Content-Type": "image/png"}, b"png"),
+        })
+        self.pretend_public("127.0.0.2")
+        base = "http://127.0.0.2:%d" % public.port
+        self.assertEqual(helper.fetch_public(base + "/img", 1000, "image/*"), (b"", ""))
+        self.assertEqual(secret.hits, [])
+        self.assertEqual(helper.fetch_public(base + "/ok", 1000, "image/*"), (b"png", "image/png"))
+
+    def test_a_redirect_loop_ends(self):
+        public = self.serve("127.0.0.2", {"/loop": (302, {"Location": "/loop"}, b"")})
+        self.pretend_public("127.0.0.2")
+        url = "http://127.0.0.2:%d/loop" % public.port
+        self.assertEqual(helper.fetch_public(url, 1000, "*/*"), (b"", ""))
+        self.assertEqual(len(public.hits), helper.MAX_CARD_REDIRECTS + 1)
+
+    def test_a_card_never_uploads_a_private_image(self):
+        secret = self.serve("127.0.0.1", {"/cam.jpg": (200, {"Content-Type": "image/jpeg"}, b"secret")})
+        page = (b'<html><head><meta property="og:title" content="Hi">'
+                b'<meta property="og:image" content="http://127.0.0.1:%d/cam.jpg"></head></html>'
+                % secret.port)
+        public = self.serve("127.0.0.2", {"/": (200, {"Content-Type": "text/html"}, page)})
+        self.pretend_public("127.0.0.2")
+        with unittest.mock.patch.object(helper, "upload_blob") as upload:
+            card = helper.link_card("http://127.0.0.2:%d/" % public.port)
+        self.assertEqual(card["external"]["title"], "Hi")
+        self.assertNotIn("thumb", card["external"])
+        upload.assert_not_called()
+        self.assertEqual(secret.hits, [])
 
 
 # ------------------------------------------------------------------ uploads
