@@ -5,7 +5,7 @@ with images and alt text, and the usual interactions. Built after the
 [Mastodon client](https://github.com/saigkill/omarchy-mastodon) and sharing its
 design rules.
 
-![Preview](https://github.com/saigkill/omarchy-bluesky/blob/master/preview.png?raw=true)
+![Preview](https://github.com/saigkill/omarchy-bluesky/blob/main/preview.png?raw=true)
 
 Features
 
