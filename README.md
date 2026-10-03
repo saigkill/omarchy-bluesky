@@ -5,7 +5,9 @@ with images and alt text, and the usual interactions. Built after the
 [Mastodon client](https://github.com/saigkill/omarchy-mastodon) and sharing its
 design rules.
 
-## Features
+![Preview](https://github.com/saigkill/omarchy-bluesky/blob/master/preview.png?raw=true)
+
+Features
 
 - **Bar widget**: a butterfly in the bar, red while logged out. Opens a panel
   with:
